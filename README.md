@@ -5,6 +5,6 @@ The client load parts of a selected file from a dataset directly into a pandas d
 
 ## Setup
 
-This project uses pdm (https://pdm-project.org/latest/) as its package manager. See the webpage for installation instructions.
+The client uses pdm (https://pdm-project.org/latest/) as its package manager. See the webpage for installation instructions.
 
 Tests and lints can be run with `pdm run test` and `pdm run lint`.
