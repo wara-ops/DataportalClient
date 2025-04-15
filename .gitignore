@@ -1,0 +1,11 @@
+__pycache__
+.datafile
+.pytest_cache
+.pdm-python
+.pdm-build
+dist
+.tox
+.venv
+.cache
+generated_testfiles
+download_testfiles

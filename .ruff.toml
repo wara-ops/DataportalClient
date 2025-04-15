@@ -1,0 +1,30 @@
+include = ["*.py"]
+
+exclude = [
+    "./test[0-9].py",
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".local",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+]
+
+line-length = 180
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401"]
