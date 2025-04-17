@@ -34,9 +34,7 @@ from tests.settings import (
 )
 
 from requests.exceptions import HTTPError, ChunkedEncodingError
-
-from src.dataportal import DataportalClient
-from src.dataportal.dataportalclient import NoDatasetError, UnsupportedExtentionError, Dataset, File, ChunkedList
+from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, UnsupportedExtentionError, Dataset, File, ChunkedList
 
 os.environ["DATAPORTAL_API"] = mockurl
 
@@ -128,6 +126,11 @@ def mocked_responses(mocker):
         urlParts = urllib.parse.urlparse(url)
         if headers["Authorization"].split(' ')[-1] != mocktoken:
             mockresp.status_code = 400
+            return mockresp
+
+        matched = re.fullmatch('.*v1/version', urlParts.path)
+        if matched:
+            mockresp.content = b'v1.2.3'
             return mockresp
 
         matched = re.fullmatch('.*v1/validatetoken', urlParts.path)
@@ -233,6 +236,8 @@ def mocked_responses(mocker):
 def client_clean():
     return DataportalClient(mocktoken, cleanStart=True)
 
+
+
 class TestCreateClient:
     def test_create_client(self, caplog):
         with caplog.at_level(logging.INFO):
@@ -243,6 +248,18 @@ class TestCreateClient:
         with caplog.at_level(logging.INFO):
             DataportalClient(mocktoken, cleanStart=True)
             assert "Connection OK" in caplog.text
+
+    def test_wrong_API_version_major(self, caplog, mocker):
+        mocker.patch('src.dataportal.DataportalClient._getAPIReqVersion', side_effect=lambda: 'v0.0.0')
+        with caplog.at_level(logging.INFO):
+            DataportalClient(mocktoken)
+            assert "Major version missmatch" in caplog.text
+
+    def test_wrong_API_version_minor(self, caplog, mocker):
+        mocker.patch('src.dataportal.DataportalClient._getAPIReqVersion', side_effect=lambda: 'v1.3.0')
+        with caplog.at_level(logging.INFO):
+            DataportalClient(mocktoken)
+            assert "Assumed minor version larger" in caplog.text
 
     def test_wrong_token(self):
         with pytest.raises(HTTPError):

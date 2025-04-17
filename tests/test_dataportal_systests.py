@@ -20,8 +20,7 @@ from tests.settings import (
 
 from requests.exceptions import HTTPError
 
-from src.dataportal import DataportalClient
-from src.dataportal.dataportalclient import NoDatasetError, Dataset, ChunkedList
+from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, Dataset, ChunkedList
 
 if "DATAPORTAL_API" not in os.environ:
     os.environ["DATAPORTAL_API"] = systests_url

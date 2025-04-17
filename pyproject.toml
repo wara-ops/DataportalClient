@@ -1,6 +1,6 @@
 [project]
 name = "dataportalclient"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Simplifies loading data from the WARA-Ops dataportal"
 authors = [
     {name = "Johan Ruuskanen", email = "johan.ruuskanen@ericsson.com"},
@@ -14,6 +14,7 @@ dependencies = [
     "pydantic~=2.10.5",
     "requests~=2.31.0",
     "frozendict~=2.4.0",
+    "pip>=25.0.1",
 ]
 requires-python = ">=3.10, <3.14"
 readme = "README.md"
@@ -23,7 +24,27 @@ license = {text = "For Ericsson use only"}
 requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
-[tool.pdm.dev-dependencies]
+[tool.pdm.scripts]
+test = "pytest tests/test_dataportal.py"
+systest = "pytest tests/test_dataportal_systests.py"
+tox = "tox"
+lint = "ruff check"
+format = "ruff format"
+
+pre_build = "cp versions.py src/dataportal/versions.py"
+pre_test = "cp versions.py src/dataportal/versions.py"
+pre_systest = "cp versions.py src/dataportal/versions.py"
+
+[tool.pdm.version]
+source = "file"
+path = "versions.py"
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests"
+]
+
+[dependency-groups]
 dev = [
     "pytest>=7.4.3",
     "pytest-mock>=3.12.0",
@@ -32,16 +53,5 @@ dev = [
     "tox-pdm>=0.7.0",
     "zstandard>=0.22.0",
     "peewee>=3.17.1",
-]
-
-[tool.pdm.scripts]
-test = "pytest tests/test_dataportal.py"
-systest = "pytest tests/test_dataportal_systests.py"
-tox = "tox"
-lint = "ruff check"
-format = "ruff format"
-
-[tool.pytest.ini_options]
-testpaths = [
-    "tests"
+    "pip>=25.0.1",
 ]

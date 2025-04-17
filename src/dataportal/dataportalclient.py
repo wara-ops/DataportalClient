@@ -6,6 +6,8 @@ import time
 
 import logging
 
+from dataportal.versions import __api_version__
+
 from pydantic import BaseModel, ValidationError
 from datetime import datetime
 from dataportal.chunkedlist import ChunkedList
@@ -128,7 +130,8 @@ class DataportalClient:
         self.cachepath = os.path.join(basepath, self.relcachepath)
         self.statepath = os.path.join(self.cachepath, self.statefile)
 
-        self._checkToken()
+        self.req_api_version = self._getAPIReqVersion()
+        self._checkAPIAccess()
 
         self._stateLoad()
         if cleanStart:
@@ -164,10 +167,32 @@ class DataportalClient:
         finally:
             self._stateSave()
 
-    # Validate token towards API
-    def _checkToken(self):
+    # Validate token and API version
+    def _checkAPIAccess(self):
+
+        def versionsXYZ(versionstr: str):
+            X, Y, Z = versionstr.split('.')
+            return X.strip('v'), Y, Z.split('-')[0]
+
         _logger.debug(f"connecting to {self.url}...")
+
+        dataportal_api_version = self._sendRequest("v1/version").content.decode('utf-8')
+        _logger.debug(f"server API version: {dataportal_api_version}, should be same minor/patch as {self.req_api_version}")
+
+        server_major, server_minor, _ = versionsXYZ(dataportal_api_version)
+        req_major, req_minor, _ = versionsXYZ(self.req_api_version)
+
+        common_err_msg = f"Client assumes API compatible with version {self.req_api_version}, but portal API is {dataportal_api_version}."
+        if server_major != req_major:
+            _logger.warning(common_err_msg)
+            _logger.warning("Major version missmatch, expect errors and unwanted behavior.")
+        elif server_minor < req_minor:
+            _logger.warning(common_err_msg)
+            _logger.warning("Assumed minor version larger, some functionalities might not be supported.")
+
         self._sendRequest("v1/validatetoken")
+        _logger.debug("token validation successfull")
+
         _logger.info("Connection OK")
 
     # Download file on fileID, will retry "self.recconectAttempt" times.
@@ -194,6 +219,10 @@ class DataportalClient:
 
     def _errTextNoFile(self, dataset: Dataset, fileid: int):
         return f'File with ID {fileid} could not be found in dataset {dataset.DatasetName}'
+
+    # As a function for mocking purposes
+    def _getAPIReqVersion(self):
+        return __api_version__
 
     def _isDatasetLoaded(self):
         if self.state.dataset is None:

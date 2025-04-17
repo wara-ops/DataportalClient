@@ -9,3 +9,4 @@ dist
 .cache
 generated_testfiles
 download_testfiles
+src/dataportal/versions.py
