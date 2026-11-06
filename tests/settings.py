@@ -230,6 +230,18 @@ systests_url = "http://localhost:3001"
 
 systests_datasetname = 'metricdumps'
 
+# TestGetParquetFromTestSystem uploads its own fixture files into systests_datasetname and deletes
+# them again. Every uploaded file is named <prefix><run id><letter>.<ext>, so a run that was killed
+# before its teardown can be recognised (and cleaned up) by the next one. Must contain no '_' or '.'
+# (the portal builds the stored name from the part of the upload name before the first '_').
+# Full stem: <prefix><7 chars base36 upload time><8 hex run id><letter>
+systests_parquet_prefix = 'systestpq'
+systests_parquet_rows = 50
+# The stem also carries the upload time (base36 seconds), because the files listing has no CreateDate.
+# A run only deletes leftovers of OTHER runs that are older than this (seconds); the system-tests job
+# is a 4-way matrix hitting the same dataset, so a sibling's in-flight files are minutes old at most.
+systests_parquet_stale_age = 2 * 60 * 60
+
 ### Common test functions ###
 
 def check_cache(client: DataportalClient, dataFileCached=True):

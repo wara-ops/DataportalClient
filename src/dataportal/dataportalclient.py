@@ -2,9 +2,11 @@ import json
 import os
 import pandas as pd
 import requests
+import tempfile
 import time
 
 import logging
+import zstandard
 
 from dataportal.versions import __api_version__
 
@@ -14,6 +16,9 @@ from dataportal.chunkedlist import ChunkedList
 from dataportal.logger import get_logger
 
 _logger = get_logger()
+
+_PARQUET_MAGIC = b"PAR1"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 # TODO:
 #   Update listFiles to include general index, orderBy and sortBy
@@ -232,12 +237,74 @@ class DataportalClient:
         if self.state.file is None:
             raise NoDatasetError("No loaded file could be found, have you selected a file?")
 
+    # Creates a generator yielding ONE dataframe from a parquet file (read_parquet has no chunksize,
+    # same shape as the pickle path). The format is decided by the file's first bytes, not its name:
+    # the portal's ingester names plain parquet files '*.parquet.zst' (zstd is only the internal
+    # column codec), while a genuinely zstd-wrapped parquet would start with the zstd frame magic.
+    # The sniff is done eagerly so an unusable file fails at the call, the read itself is lazy.
+    def _parseParquet(self, datafile: str, **extraArgs):
+        name = self.state.file.MFileName
+        # `compression` is meaningless for parquet -- the codec is recorded per
+        # column chunk inside the file -- and pandas rejects it outright:
+        #   TypeError: read_table() got an unexpected keyword argument 'compression'
+        # Users reasonably pass it anyway, because the .parquet.zst name looks
+        # like an outer compression and because other tutorials do it for
+        # .pkl.bz2 (DataAnalysis2 calls getData(id, compression='bz2')). Drop it
+        # with a warning instead of failing on a correct, readable file.
+        if "compression" in extraArgs:
+            dropped = extraArgs.pop("compression")
+            _logger.warning(
+                "ignoring compression=%r for %s: parquet stores its codec inside the file, "
+                "so pandas.read_parquet takes no compression argument",
+                dropped, name,
+            )
+        with open(datafile, "rb") as f:
+            head = f.read(4)
+
+        if head == _PARQUET_MAGIC:
+            wrapped = False
+        elif head == _ZSTD_MAGIC:
+            wrapped = True
+        else:
+            raise UnsupportedExtentionError(
+                f"file {name} is named as parquet but is neither a parquet file (expected first bytes {_PARQUET_MAGIC!r}) "
+                f"nor a zstd-compressed parquet file (expected {_ZSTD_MAGIC!r}); first bytes are {head!r}"
+            )
+
+        def read(path):
+            try:
+                return pd.read_parquet(path, **extraArgs)
+            except ImportError as e:
+                raise ParquetEngineMissingError(
+                    f"Reading parquet file {name} requires a parquet engine, but none could be used ({e}). "
+                    "Install one with: pip install pyarrow"
+                ) from e
+
+        def parseParquet():
+            if not wrapped:
+                yield read(datafile)
+                return
+            # Stream-decompress to a temporary file next to the cache (pyarrow needs a seekable
+            # input) instead of holding compressed and decompressed copies in memory.
+            fd, tmppath = tempfile.mkstemp(suffix=".parquet.tmp", dir=os.path.dirname(datafile) or None)
+            try:
+                with os.fdopen(fd, "wb") as dst, open(datafile, "rb") as src:
+                    zstandard.ZstdDecompressor().copy_stream(src, dst)
+                yield read(tmppath)
+            finally:
+                if os.path.exists(tmppath):
+                    os.remove(tmppath)
+
+        return parseParquet()
+
     # Creates a pandas dataframe generator from the selected datafile.
     def _partiallyParseData(self, datafile: str, entries: int, **extraArgs):
         def parsePickle():
             yield pd.read_pickle(datafile, **extraArgs)
 
-        if ".pkl" in self.state.file.MFileName:
+        if ".parquet" in self.state.file.MFileName:
+            return self._parseParquet(datafile, **extraArgs)
+        elif ".pkl" in self.state.file.MFileName:
             return parsePickle()
         elif ".csv" in self.state.file.MFileName:
             return pd.read_csv(datafile, chunksize=entries, **extraArgs)
@@ -380,6 +447,15 @@ class DataportalClient:
                 pandas.read_pickle(file, **extraArgs)
             .csv
                 pandas.read_csv(file, chunksize=entries, **extraArgs)
+            .parquet (also .parquet.zst, .zstd.parquet, ...)
+                pandas.read_parquet(file, **extraArgs)
+
+            Notes on parquet: the portal's MQTT ingester writes files named '*.parquet.zst', but these
+            are plain parquet files (zstd is only the compression of the columns inside), not
+            zstd-wrapped ones. The format is therefore detected from the file's first bytes rather than
+            from its name, so both plain and genuinely zstd-compressed parquet files load. Parquet files
+            are not chunkable: 'entries' is ignored (like for .pkl), and generator=True yields a single
+            dataframe with the whole file. Reading parquet requires pyarrow (pip install pyarrow).
 
             Parameters
             ----------
@@ -389,7 +465,7 @@ class DataportalClient:
                 error will be raised.
             entries : int, optional
                 the number of entries to be included in the dataframe. Only valid for chunkable file formats,
-                e.g. not .pkl files. If set to -1, all entries will be read. Use this at your own risk for
+                e.g. not .pkl or .parquet files. If set to -1, all entries will be read. Use this at your own risk for
                 larger files. Defaults to 100000.
             generator : bool, optional
                 if a generator of dataframes over the data should be returned. This allows for iterating over
@@ -447,6 +523,28 @@ class DataportalClient:
             returns a tuple with (id_list, failures), where
                 id_list: list[int]
                 failures: dict with ids as keys and exceptions as value
+
+            Notes
+            -----
+            Save location and naming:
+                Each extrafile is written to the CURRENT WORKING DIRECTORY using
+                only its bare file name (the server's ``MFileName``). Any storage
+                prefix the file was uploaded with (e.g. ``dir1/dir2``) is NOT
+                recreated on download — files are saved flat, not in sub-folders.
+
+                As a consequence, two extrafiles that share the same file name but
+                were uploaded under different prefixes (e.g. ``dir1/readme.md`` and
+                ``dir2/readme.md``) will both be written to ``./readme.md`` and the
+                later download will OVERWRITE the earlier one. If you rely on the
+                prefix to disambiguate same-named files, download them into separate
+                working directories, or inspect the ``prefix`` field returned by
+                ``listFiles(extraFiles=True)`` and move/rename the files yourself
+                after download.
+
+                The internal storage base folder used to keep extrafiles from
+                colliding with datafile year buckets is never exposed by the API —
+                listings report only the user-facing ``prefix`` (e.g. ``dir1/dir2``),
+                and downloads use only the bare file name.
         """
 
         self._isDatasetLoaded()
@@ -536,6 +634,10 @@ class DataportalClient:
         )
 
 class UnsupportedExtentionError(Exception):
+    pass
+
+
+class ParquetEngineMissingError(ImportError):
     pass
 
 

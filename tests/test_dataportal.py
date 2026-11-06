@@ -5,6 +5,7 @@ import pandas as pd
 import re
 import math
 import logging
+import inspect
 
 import urllib.parse
 from copy import deepcopy
@@ -34,7 +35,9 @@ from tests.settings import (
 )
 
 from requests.exceptions import HTTPError, ChunkedEncodingError
-from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, UnsupportedExtentionError, Dataset, File, ChunkedList
+import zstandard
+
+from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, UnsupportedExtentionError, ParquetEngineMissingError, Dataset, File, ChunkedList
 
 os.environ["DATAPORTAL_API"] = mockurl
 
@@ -694,3 +697,133 @@ class TestGetExtrafiles:
 
         # No file downloaded
         assert len(os.listdir(mockdownloaddir)) == 0
+
+
+class TestGetDataParquet:
+    """
+    Parquet files are not part of the generated metric/log file matrix (that would multiply every
+    file-listing expectation), so each test writes its own file into the mock file directory and
+    temporarily registers it in the mock dataset listing.
+    """
+
+    df = pd.DataFrame({
+        'ts': pd.date_range('2026-10-06T09:10:32', periods=7, freq='s'),
+        'value': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+        'topic': ['a', 'b', 'c', 'a', 'b', 'c', 'a'],
+    })
+
+    @pytest.fixture
+    def addparquet(self):
+        mockds = mockfiles[mockdatasetids[mockdsmetrics]]
+        added = []
+
+        def add(filename: str, content: bytes):
+            with open(os.path.join(mockfilesdir, filename), 'wb') as f:
+                f.write(content)
+            fileid = max(fo['FileID'] for fl in mockfiles.values() for fo in fl) + 1
+            fileentry = {
+                "FileID": fileid,
+                "MFileName": filename,
+                "OriginName": 'somedatasource',
+                "StartDate": '2026-10-06T00:00:00Z',
+                "StopDate": '2026-10-07T00:00:00Z',
+                "FileSize": len(content),
+                "MetricEntries": len(self.df),
+                "MetricType": 'float',
+                "ExtraFile": False
+            }
+            mockds.append(fileentry)
+            added.append(fileentry)
+            return fileid
+
+        yield add
+
+        for fileentry in added:
+            mockds.remove(fileentry)
+            os.remove(os.path.join(mockfilesdir, fileentry['MFileName']))
+
+    @staticmethod
+    def parquetbytes(df, tmp_path, **kwargs):
+        path = tmp_path / 'written.parquet'
+        df.to_parquet(path, **kwargs)
+        return path.read_bytes()
+
+    def test_ingester_style_parquet_zst(self, client_clean: DataportalClient, addparquet, tmp_path):
+        # exactly how the portal's MQTT ingester writes: to_parquet(compression='zstd'), named .parquet.zst
+        content = self.parquetbytes(self.df, tmp_path, compression='zstd')
+        assert content[:4] == b'PAR1'  # plain parquet, zstd is only the column codec
+        fileid = addparquet('mqtt_mixed_2026-10-06T09:10:32.508_raw.parquet.zst', content)
+
+        client_clean.fromDataset(mockdsmetrics)
+        df = client_clean.getData(fileid)
+        pd.testing.assert_frame_equal(df, self.df)
+        check_cache(client_clean)
+
+    def test_plain_parquet(self, client_clean: DataportalClient, addparquet, tmp_path):
+        fileid = addparquet('plainfile.parquet', self.parquetbytes(self.df, tmp_path))
+
+        client_clean.fromDataset(mockdsmetrics)
+        df = client_clean.getData(fileid)
+        pd.testing.assert_frame_equal(df, self.df)
+        check_cache(client_clean)
+
+    def test_zstd_wrapped_parquet(self, client_clean: DataportalClient, addparquet, tmp_path):
+        content = zstandard.ZstdCompressor().compress(self.parquetbytes(self.df, tmp_path))
+        assert content[:4] == b'\x28\xb5\x2f\xfd'
+        fileid = addparquet('wrapped.parquet.zst', content)
+
+        client_clean.fromDataset(mockdsmetrics)
+        df = client_clean.getData(fileid)
+        pd.testing.assert_frame_equal(df, self.df)
+        # the temporary decompressed copy must be gone, only the cached file and statefile remain
+        check_cache(client_clean)
+
+    def test_unrecognised_bytes_error(self, client_clean: DataportalClient, addparquet):
+        fileid = addparquet('notparquet.parquet', b'hello, this is not parquet')
+
+        client_clean.fromDataset(mockdsmetrics)
+        with pytest.raises(UnsupportedExtentionError) as e:
+            client_clean.getData(fileid)
+        assert "b'hell'" in str(e.value)
+        assert 'notparquet.parquet' in str(e.value)
+
+    def test_generator_yields_single_frame(self, client_clean: DataportalClient, addparquet, tmp_path):
+        fileid = addparquet('gen.parquet.zst', self.parquetbytes(self.df, tmp_path, compression='zstd'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        # 'entries' does not apply to parquet, so the whole file comes back as one frame
+        dfgen = client_clean.getData(fileid, entries=2, generator=True)
+        assert inspect.isgenerator(dfgen)
+
+        dfs = list(dfgen)
+        assert len(dfs) == 1
+        pd.testing.assert_frame_equal(dfs[0], self.df)
+        check_cache(client_clean)
+
+    def test_entries_ignored(self, client_clean: DataportalClient, addparquet, tmp_path):
+        fileid = addparquet('entries.parquet', self.parquetbytes(self.df, tmp_path))
+
+        client_clean.fromDataset(mockdsmetrics)
+        assert client_clean.getData(fileid, entries=2).shape == self.df.shape
+
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_extraargs_passthrough(self, client_clean: DataportalClient, addparquet, tmp_path, wrapped):
+        content = self.parquetbytes(self.df, tmp_path, compression='zstd')
+        if wrapped:
+            content = zstandard.ZstdCompressor().compress(content)
+        fileid = addparquet('columns.parquet.zst', content)
+
+        client_clean.fromDataset(mockdsmetrics)
+        df = client_clean.getData(fileid, columns=['topic', 'value'])
+        assert list(df.columns) == ['topic', 'value']
+        pd.testing.assert_frame_equal(df, self.df[['topic', 'value']])
+
+    def test_missing_engine_error(self, client_clean: DataportalClient, addparquet, tmp_path, mocker):
+        fileid = addparquet('noengine.parquet.zst', self.parquetbytes(self.df, tmp_path, compression='zstd'))
+        mocker.patch('pandas.read_parquet', side_effect=ImportError('Unable to find a usable engine'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        with pytest.raises(ParquetEngineMissingError) as e:
+            client_clean.getData(fileid)
+        assert 'pip install pyarrow' in str(e.value)
+        assert 'noengine.parquet.zst' in str(e.value)
