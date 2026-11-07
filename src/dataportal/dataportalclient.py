@@ -1,19 +1,19 @@
 import json
+import logging
 import os
-import pandas as pd
-import requests
 import tempfile
 import time
-
-import logging
-import zstandard
-
-from dataportal.versions import __api_version__
-
-from pydantic import BaseModel, ValidationError
 from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import requests
+import zstandard
+from pydantic import BaseModel, ValidationError
+
 from dataportal.chunkedlist import ChunkedList
 from dataportal.logger import get_logger
+from dataportal.versions import __api_version__
 
 _logger = get_logger()
 
@@ -132,8 +132,8 @@ class DataportalClient:
         self.url = os.environ["DATAPORTAL_API"]
 
         basepath = os.environ.get("DATAPORTAL_CLIENT_BASEPATH", os.environ["HOME"])
-        self.cachepath = os.path.join(basepath, self.relcachepath)
-        self.statepath = os.path.join(self.cachepath, self.statefile)
+        self.cachepath = str(Path(basepath) / self.relcachepath)
+        self.statepath = str(Path(self.cachepath) / self.statefile)
 
         self.req_api_version = self._getAPIReqVersion()
         self._checkAPIAccess()
@@ -149,16 +149,15 @@ class DataportalClient:
             fileinfo = self._sendRequest(f"v1/dataset/{self.state.dataset.DatasetID}/files/{fileID}").json()
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                raise ValueError(self._errTextNoFile(self.state.dataset, fileID))
-            else:
-                raise e
+                raise ValueError(self._errTextNoFile(self.state.dataset, fileID)) from e
+            raise e
 
         if fileinfo['ExtraFile']:
             raise ValueError(f'File with ID {fileID} is an extrafile, not a datafile. Use client.getExtraFiles({fileID}) to obtain it.')
 
         if self.state.file is not None:
             try:
-                os.remove(os.path.join(self.cachepath, self.state.file.MFileName))
+                (Path(self.cachepath) / self.state.file.MFileName).unlink()
             except FileNotFoundError:
                 _logger.debug('cached file could not be found')
 
@@ -207,7 +206,7 @@ class DataportalClient:
             try:
                 with self._sendRequest(f"v1/dataset/{self.state.dataset.DatasetID}/files/{fileID}/content", query={'extrafile': 'true' if extrafile else 'false'}, stream=True) as r:
                     filename = r.headers["Content-disposition"].split("filename=")[-1]
-                    with open(os.path.join(destPath, filename), "wb") as f:
+                    with (Path(destPath) / filename).open("wb") as f:
                         for chunk in r.iter_content(chunk_size=8192):
                             f.write(chunk)
                 break
@@ -258,7 +257,7 @@ class DataportalClient:
                 "so pandas.read_parquet takes no compression argument",
                 dropped, name,
             )
-        with open(datafile, "rb") as f:
+        with Path(datafile).open("rb") as f:
             head = f.read(4)
 
         if head == _PARQUET_MAGIC:
@@ -286,14 +285,13 @@ class DataportalClient:
                 return
             # Stream-decompress to a temporary file next to the cache (pyarrow needs a seekable
             # input) instead of holding compressed and decompressed copies in memory.
-            fd, tmppath = tempfile.mkstemp(suffix=".parquet.tmp", dir=os.path.dirname(datafile) or None)
+            fd, tmppath = tempfile.mkstemp(suffix=".parquet.tmp", dir=os.path.dirname(datafile) or None)  # noqa: PTH120 - Path('x').parent is '.', dirname gives '' -> None (system tmp)
             try:
-                with os.fdopen(fd, "wb") as dst, open(datafile, "rb") as src:
+                with os.fdopen(fd, "wb") as dst, Path(datafile).open("rb") as src:
                     zstandard.ZstdDecompressor().copy_stream(src, dst)
                 yield read(tmppath)
             finally:
-                if os.path.exists(tmppath):
-                    os.remove(tmppath)
+                Path(tmppath).unlink(missing_ok=True)
 
         return parseParquet()
 
@@ -304,33 +302,34 @@ class DataportalClient:
 
         if ".parquet" in self.state.file.MFileName:
             return self._parseParquet(datafile, **extraArgs)
-        elif ".pkl" in self.state.file.MFileName:
+        if ".pkl" in self.state.file.MFileName:
             return parsePickle()
-        elif ".csv" in self.state.file.MFileName:
+        if ".csv" in self.state.file.MFileName:
             return pd.read_csv(datafile, chunksize=entries, **extraArgs)
-        elif ".json" in self.state.file.MFileName:
+        if ".json" in self.state.file.MFileName:
             return pd.read_json(datafile, chunksize=entries, lines=True, **extraArgs)
-        else:
-            try:  # if can be parsed as json, do so
-                return pd.read_json(datafile, chunksize=entries, lines=True, **extraArgs)
-            except Exception:
-                raise UnsupportedExtentionError(f"file {self.state.file.MFileName} can not be parsed")
+        try:  # if can be parsed as json, do so
+            return pd.read_json(datafile, chunksize=entries, lines=True, **extraArgs)
+        except Exception as e:
+            raise UnsupportedExtentionError(f"file {self.state.file.MFileName} can not be parsed") from e
 
     # Performs a requests to the API with the given path and query parameters
-    def _sendRequest(self, path: str, query={}, stream=False):
+    def _sendRequest(self, path: str, query: dict | None = None, stream=False):
+        if query is None:
+            query = {}
         if query:
             query_string = "?" + "&".join([f"{key}={value}" for (key, value) in query.items()])
         else:
             query_string = ""
         _logger.debug(f"sending {path + query_string}")
-        response = self._s.get(os.path.join(self.url, path) + query_string, headers={"Authorization": "Bearer " + self.token}, stream=stream)
+        response = self._s.get(os.path.join(self.url, path) + query_string, headers={"Authorization": "Bearer " + self.token}, stream=stream)  # noqa: PTH118 - Path would eat the // in the URL scheme
         response.raise_for_status()
         return response
 
      # Load state file if it exists, otherwise create the path if missing
     def _stateLoad(self):
-        if os.path.isfile(self.statepath):
-            with open(self.statepath, 'r') as f:
+        if Path(self.statepath).is_file():
+            with Path(self.statepath).open() as f:
                 try:
                     self.state = State(**json.load(f))
                 except ValidationError as e:
@@ -340,22 +339,22 @@ class DataportalClient:
                     _logger.exception(e)
                     self.state = State()
         else:
-            os.makedirs(self.cachepath, exist_ok=True)
+            Path(self.cachepath).mkdir(parents=True, exist_ok=True)
             self.state = State()
 
     # Removes loaded file and resets the state
     def _stateReset(self):
         if self.state.file is not None:
-            filepath = os.path.join(self.cachepath, self.state.file.MFileName)
-            if os.path.isfile(filepath):
-                os.remove(filepath)
-        if os.path.isfile(self.statepath):
-            os.remove(self.statepath)
+            filepath = Path(self.cachepath) / self.state.file.MFileName
+            if filepath.is_file():
+                filepath.unlink()
+        if Path(self.statepath).is_file():
+            Path(self.statepath).unlink()
         self.state = State()
 
     # Saves the state to file
     def _stateSave(self):
-        with open(self.statepath, 'w') as f:
+        with Path(self.statepath).open('w') as f:
             f.write(self.state.model_dump_json())
 
     def currentDataset(self):
@@ -410,11 +409,11 @@ class DataportalClient:
 
         newdataset = None
 
-        if isinstance(idOrName, str) and (self.state.dataset is None or not self.state.dataset.DatasetName == idOrName):
+        if isinstance(idOrName, str) and (self.state.dataset is None or self.state.dataset.DatasetName != idOrName):
             newdataset = Dataset(**getDatasetBy("DatasetName"))
             _logger.debug("setting new dataset with name")
 
-        elif isinstance(idOrName, int) and (self.state.dataset is None or not self.state.dataset.DatasetID == idOrName):
+        elif isinstance(idOrName, int) and (self.state.dataset is None or self.state.dataset.DatasetID != idOrName):
             newdataset = Dataset(**getDatasetBy("DatasetID"))
             _logger.debug("setting new dataset with id")
 
@@ -492,7 +491,7 @@ class DataportalClient:
         if self.state.file is None or self.state.file.FileID != fileID:
             self._cacheDataFile(fileID)
 
-        datafile = os.path.join(self.cachepath, self.state.file.MFileName)
+        datafile = str(Path(self.cachepath) / self.state.file.MFileName)
 
         if datatype:
             _logger.warning('WARNING - deprecated: argument "datatype" is no longer in use')
@@ -502,8 +501,7 @@ class DataportalClient:
         # Generator can be returned, but the default is the first dataframe
         if generator:
             return df_generator
-        else:
-            return next(df_generator)
+        return next(df_generator)
 
 
     # give fileID as int or intparsable string, can also give list of fileIDs. no fileID supplied will fetch all

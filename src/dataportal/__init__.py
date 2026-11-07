@@ -1,2 +1,2 @@
-from .dataportalclient import DataportalClient
 from .chunkedlist import ChunkedList
+from .dataportalclient import DataportalClient

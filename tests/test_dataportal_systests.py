@@ -1,38 +1,37 @@
-import os
-import pytest
-import json
-import pandas as pd
-import logging
 import datetime
 import hashlib
 import io
+import json
+import logging
+import os
 import re
 import time
 import uuid
-import zstandard
-
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+from pathlib import Path
 
+import pandas as pd
+import pytest
 import requests
+import zstandard
+from requests.exceptions import HTTPError
 
+from src.dataportal.dataportalclient import ChunkedList, DataportalClient, Dataset, NoDatasetError, UnsupportedExtentionError
 from tests.settings import (
-    systests_testuser,
-    systests_testpw,
-    systests_url,
+    check_cache,
+    check_extra_files,
+    listdir_names,
+    mockdownloaddir,
     systests_datasetname,
     systests_parquet_prefix,
     systests_parquet_rows,
     systests_parquet_stale_age,
-    mockdownloaddir,
-    check_cache,
-    check_extra_files,
-    verify_files
+    systests_testpw,
+    systests_testuser,
+    systests_url,
+    verify_files,
 )
-
-from requests.exceptions import HTTPError
-
-from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, Dataset, ChunkedList, UnsupportedExtentionError
 
 if "DATAPORTAL_API" not in os.environ:
     os.environ["DATAPORTAL_API"] = systests_url
@@ -40,14 +39,20 @@ else:
     print(f"DATAPORTAL_API env variable already set to {os.environ['DATAPORTAL_API']}")
 
 
+_logger = logging.getLogger(__name__)
+
 s = requests.Session()
-def session_post(path, json, headers={}):
-    response = s.post(os.path.join(os.environ["DATAPORTAL_API"], path), json=json, headers=headers)
+def session_post(path, json, headers=None):
+    if headers is None:
+        headers = {}
+    response = s.post(os.path.join(os.environ["DATAPORTAL_API"], path), json=json, headers=headers)  # noqa: PTH118 - Path would eat the // in the URL scheme
     response.raise_for_status()
     return response
 
-def session_get(path, headers={}):
-    response = s.get(os.path.join(os.environ["DATAPORTAL_API"], path), headers=headers)
+def session_get(path, headers=None):
+    if headers is None:
+        headers = {}
+    response = s.get(os.path.join(os.environ["DATAPORTAL_API"], path), headers=headers)  # noqa: PTH118 - Path would eat the // in the URL scheme
     response.raise_for_status()
     return response
 
@@ -67,8 +72,8 @@ datasets = session_get('v1/dataset').json()['Datasets']
 
 try:
     testdataset = [ds for ds in datasets if ds['DatasetName'] == systests_datasetname].pop()
-except IndexError:
-    raise ValueError(f"Cannot find testdataset {systests_datasetname} in test system")
+except IndexError as e:
+    raise ValueError(f"Cannot find testdataset {systests_datasetname} in test system") from e
 
 response = session_get(f"v1/dataset/{testdataset['DatasetID']}/files").json()
 
@@ -244,6 +249,62 @@ class TestListFilesFromTestSystem:
         assert isinstance(files, ChunkedList)
         assert list(files) == testfiles_entriessorted
 
+    # --- ChunkedList indexing against the REAL portal -------------------------
+    # files[fileid] had no systest coverage at all, which is how three defects in
+    # __getitem__ survived: a KeyError message that printed the literal "{index}",
+    # a non-404 response falling off the end of the function and returning None,
+    # and the extrafile fallback. The unit tests for these are mocked; these run
+    # the same paths against a live portal, where the 404 that triggers the
+    # fallback is produced by the portal itself rather than by a fixture.
+
+    def test_getitem_returns_the_datafile(self, client_testds: DataportalClient):
+        files = client_testds.listFiles()
+        wanted = testfiles[0]
+
+        record = files[wanted['FileID']]
+
+        assert record is not None, "__getitem__ must never return None"
+        assert record['FileID'] == wanted['FileID']
+        assert record['MFileName'] == wanted['MFileName']
+
+    @pytest.mark.skipif(not testextrafiles, reason="the test dataset has no extrafiles")
+    def test_getitem_returns_an_extrafile_from_the_same_route(self, client_testds: DataportalClient):
+        # Measured against the portal: the plain single-file route answers 200 for an
+        # extrafile, and rejects ?extrafile=true with 400. So no fallback is needed, and
+        # a second request would be the dead fallback coming back.
+        files = client_testds.listFiles()
+        wanted = testextrafiles[0]
+
+        record = files[wanted['FileID']]
+
+        assert record is not None, "__getitem__ must never return None"
+        assert record['FileID'] == wanted['FileID']
+        assert record['MFileName'] == wanted['MFileName']
+
+    def test_getitem_unknown_id_raises_keyerror_naming_the_id(self, client_testds: DataportalClient):
+        files = client_testds.listFiles()
+        missing = max(f['FileID'] for f in testfiles + testextrafiles) + 10_000
+
+        with pytest.raises(KeyError) as excinfo:
+            files[missing]
+
+        assert str(missing) in str(excinfo.value), "the id must be interpolated, not printed literally"
+        assert "{index}" not in str(excinfo.value)
+
+    def test_chunkedlist_default_constructor_against_the_portal(self):
+        # ChunkedList(url, path, token) used to raise ValueError from its own validation,
+        # because orderBy defaulted to None while None was not an allowed order field.
+        chunked = ChunkedList(
+            url=os.environ["DATAPORTAL_API"],
+            path=f"v1/dataset/{testdataset['DatasetID']}/files",
+            token=token,
+        )
+
+        listed = list(chunked)
+
+        assert [f['FileID'] for f in listed] == sorted(f['FileID'] for f in testfiles), \
+            "the default order must be FileID ascending, matching listFiles()"
+
     def test_list_files_order_by_with_index(self, client_testds: DataportalClient):
         testfiles_datesorted = sorted(testfiles, key= lambda f: fromisoformat_fix(f['StartDate']))
 
@@ -318,13 +379,13 @@ class TestGetExtrafilesFromTestSystem:
 
     @pytest.fixture(autouse=True)
     def cleanMockDownloadDir(self):
-        if os.path.isdir(mockdownloaddir):
+        if Path(mockdownloaddir).is_dir():
             dsfilenames = [file['MFileName'] for file in testextrafiles]
-            for filename in os.listdir(mockdownloaddir):
+            for filename in listdir_names(mockdownloaddir):
                 if filename in dsfilenames:
-                    os.remove(os.path.join(mockdownloaddir, filename))
+                    (Path(mockdownloaddir) / filename).unlink()
         else:
-            os.mkdir(mockdownloaddir)
+            Path(mockdownloaddir).mkdir()
 
     def test_download_extrafile(self, client_testds: DataportalClient):
         os.chdir(mockdownloaddir)
@@ -456,7 +517,7 @@ def _listed_file_ids() -> set:
 
 
 def _upload(name: str, data: bytes, rows: int, run: str) -> int:
-    start = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    start = datetime.datetime(2001, 1, 1, tzinfo=datetime.UTC)
     stop = start + datetime.timedelta(seconds=rows - 1)
     fields = {
         "start": start.strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -471,7 +532,7 @@ def _upload(name: str, data: bytes, rows: int, run: str) -> int:
     key = hashlib.sha256(run.encode() + b"\0" + name.encode() + b"\0" + data).hexdigest()
     # requests puts the form fields BEFORE the file part, the portal needs 'data' to be last
     response = s.post(
-        os.path.join(os.environ["DATAPORTAL_API"], f"v1/dataset/{testdataset['DatasetID']}/files"),
+        os.path.join(os.environ["DATAPORTAL_API"], f"v1/dataset/{testdataset['DatasetID']}/files"),  # noqa: PTH118 - Path would eat the // in the URL scheme
         data=fields, files={"data": (name, data, "application/octet-stream")},
         headers={**_auth(), "Idempotency-Key": key},
     )
@@ -503,7 +564,7 @@ def _delete(fileid: int) -> dict:
     release (that test went from xfail to pass the moment v1.3.2 was deployed),
     so the tolerance is gone: a 500 is a 500 again.
     """
-    response = s.delete(os.path.join(os.environ["DATAPORTAL_API"], f"v1/dataset/{testdataset['DatasetID']}/files/{fileid}"), headers=_auth())
+    response = s.delete(os.path.join(os.environ["DATAPORTAL_API"], f"v1/dataset/{testdataset['DatasetID']}/files/{fileid}"), headers=_auth())  # noqa: PTH118 - Path would eat the // in the URL scheme
     response.raise_for_status()
     try:
         return response.json() or {}
@@ -539,9 +600,9 @@ def uploaded():
             continue
         reason = _stale_reason(candidate['MFileName'], now)
         if reason is None:
-            logging.warning("leaving %s alone: recent, may belong to a concurrent run", candidate['MFileName'])
+            _logger.warning("leaving %s alone: recent, may belong to a concurrent run", candidate['MFileName'])
             continue
-        logging.warning("DELETING stale parquet systest file %s (FileID %s): %s", candidate['MFileName'], candidate['FileID'], reason)
+        _logger.warning("DELETING stale parquet systest file %s (FileID %s): %s", candidate['MFileName'], candidate['FileID'], reason)
         try:
             _delete(candidate['FileID'])
         except HTTPError as e:
@@ -654,7 +715,7 @@ class TestGetParquetFromTestSystem:
         heads = {}
         for perm in (PQ_D, PQ_F):
             pq_client.getData(uploaded.id(perm))
-            with open(os.path.join(pq_client.cachepath, pq_client.state.file.MFileName), 'rb') as f:
+            with (Path(pq_client.cachepath) / pq_client.state.file.MFileName).open("rb") as f:
                 heads[perm.key] = f.read(4)
         assert heads[PQ_D.key] == b"PAR1"
         assert heads[PQ_F.key] == b"\x28\xb5\x2f\xfd"
@@ -696,7 +757,7 @@ class TestGetParquetFromTestSystem:
         with pytest.raises(StopIteration):
             next(gen)
         # the zstd-wrapped case decompresses to a temp file next to the cache; it must be gone again
-        assert [f for f in os.listdir(pq_client.cachepath) if f.endswith(".parquet.tmp")] == []
+        assert [f for f in listdir_names(pq_client.cachepath) if f.endswith(".parquet.tmp")] == []
 
     def test_entries_does_not_truncate_parquet(self, pq_client: DataportalClient, uploaded: UploadedFiles):
         """entries= is ignored for parquet (not chunkable); the same argument does chunk a csv, which is the control."""

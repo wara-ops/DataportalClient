@@ -1,7 +1,22 @@
 include = ["*.py"]
 
 exclude = [
+    # Root-level scratch files, all untracked. "./test[0-9].py" was already here
+    # for test2.py/test3.py; "./test.py" covers the unnumbered one.
+    # NOTE: do NOT collapse these into "./test*.py" -- verified that ruff then
+    # excludes the whole tests/ PACKAGE as well (it goes from 5 linted files to
+    # 0), which silently stops linting the test suite.
     "./test[0-9].py",
+    "./test.py",
+    # Third-party, and not ours to lint or to fix: the CI jobs do
+    #   curl -sSL https://pdm-project.org/install-pdm.py > install-pdm.py
+    # and pass it between stages as an artifact, so it is present in the working
+    # directory when lint-ruff runs. Pristine upstream trips 5 of the rules
+    # selected below, which would fail the job on code we do not own (and any
+    # local "fix" is discarded by the next download).
+    "install-pdm.py",
+    # Leftovers from a conflicted merge are not code under review.
+    "*.orig",
     ".bzr",
     ".direnv",
     ".eggs",
@@ -25,6 +40,46 @@ exclude = [
 ]
 
 line-length = 180
+
+[lint]
+# Be EXPLICIT about the rule set. This file never declared `select`, so it
+# inherited whatever default the installed ruff happened to have -- and that
+# default is not stable: the lock bump from ruff 0.11.5 to 0.17.4 turned a clean
+# tree into 216 errors without a single line of our code changing. Naming the
+# rules means the gate means the same thing on every ruff version.
+select = [
+    # --- ruff's historical default: pycodestyle errors + Pyflakes ------------
+    "E4", "E7", "E9", "F",
+    # --- bug classes, not style ---------------------------------------------
+    "B",      # bugbear: mutable argument defaults, `raise` without `from`,
+              #          lru_cache on methods (retains self), unused loop vars
+    "PLE",    # pylint errors: genuinely broken code. Currently clean.
+    "PLW",    # pylint warnings, incl. PLW1510 subprocess.run without `check`,
+              #          i.e. a failing command silently ignored
+    "DTZ",    # naive datetimes. Currently clean, and worth keeping that way in
+              #          a client whose whole domain is timestamped data.
+    "LOG",    # logging misuse (undocumented constants, badly built records)
+    "C4",     # needless comprehension detours
+    "PIE",    # dead/duplicate code
+    "ISC",    # implicit vs explicit string concatenation
+    "SIM115", # a file opened without a context manager -- leaked descriptor
+    "SIM201", # `not x == y`
+    # --- modernization / consistency ----------------------------------------
+    "RET",    # returns: unreachable else after return/raise, pointless assign
+    "I",      # import ordering
+    "UP",     # pyupgrade: %-formatting, Optional[X] -> X | None, ...
+    "PTH",    # os.path -> pathlib
+]
+# NOT selected, deliberately:
+#   A      shadowing builtins -- the offenders are `filter=` and `id=`, which are
+#          PUBLIC keyword arguments; renaming them breaks every caller.
+#   G      logging f-strings: formats eagerly even when the level is off, but
+#          that is a micro-optimisation across ~10 call sites, not a bug.
+#   D, N   docstring style and naming: 463 + 107 findings, no bug-finding value,
+#          and the naming one would rename public camelCase API.
+#   S      bandit: 189 of its 201 findings are `assert` in tests, which is the
+#          point of tests.
+#   TRY003, PLR2004  long exception messages / magic values: noisy by design.
 
 [lint.per-file-ignores]
 "__init__.py" = ["F401"]

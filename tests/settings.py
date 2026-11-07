@@ -1,14 +1,15 @@
-import os
 import itertools
 import json
+import os
 import re
+from pathlib import Path
 
 import pandas as pd
 
 from src.dataportal import DataportalClient
-from src.dataportal.dataportalclient import State, File
+from src.dataportal.dataportalclient import File, State
 
-testsbasepath =  os.path.dirname(__file__)
+testsbasepath = str(Path(__file__).parent)
 
 os.environ["DATAPORTAL_CLIENT_BASEPATH"] = testsbasepath
 
@@ -67,8 +68,8 @@ mockdatasetmap = {
 }
 
 testfiles = {
-    'metric': os.path.join(testsbasepath, 'testfiles/metricfile.csv'),
-    'log': os.path.join(testsbasepath, 'testfiles/logfile.json')
+    'metric': str(Path(testsbasepath) / 'testfiles/metricfile.csv'),
+    'log': str(Path(testsbasepath) / 'testfiles/logfile.json')
 }
 
 extrafiles = {
@@ -89,8 +90,8 @@ mockdatashapes = {
     'log': pd.read_json(testfiles['log'], lines=True).shape
 }
 
-mockfilesdir = os.path.join(testsbasepath, 'generated_testfiles')
-mockdownloaddir = os.path.join(testsbasepath, 'download_testfiles')
+mockfilesdir = str(Path(testsbasepath) / 'generated_testfiles')
+mockdownloaddir = str(Path(testsbasepath) / 'download_testfiles')
 mocktoken = 'asd123'
 
 compressions = ['gz', 'bz2', 'zip', 'xz', 'zst', 'tar', 'tar.gz', 'tar.xz', 'tar.bz2']
@@ -219,7 +220,7 @@ for (i, errtype) in enumerate(errdstypes):
 assert (lambda ids: len(set(ids)) == len(ids))(
     [file['FileID'] for filelist in mockfiles.values() for file in filelist]
 ), "Mock file IDs are not unique!"
-assert all([ "ExtraFile" in f for mf in mockfiles.values() for f in mf])
+assert all("ExtraFile" in f for mf in mockfiles.values() for f in mf)
 
 ### For the system tests ###
 
@@ -246,34 +247,39 @@ systests_parquet_stale_age = 2 * 60 * 60
 
 def check_cache(client: DataportalClient, dataFileCached=True):
     print(client.cachepath)
-    files = os.listdir(client.cachepath)
+    files = listdir_names(client.cachepath)
 
     # Only one loaded file + statefile at any time
     assert len(files) == 1 + dataFileCached
 
     # Check that statefile exists and has size
-    localStateFile = client.statepath
-    assert os.path.isfile(localStateFile)
-    assert os.path.getsize(localStateFile) > 0
+    localStateFile = Path(client.statepath)
+    assert localStateFile.is_file()
+    assert localStateFile.stat().st_size > 0
 
     if dataFileCached:
         # Check that cached file exist and has size
-        localFile = os.path.join(client.cachepath, client.state.file.MFileName)
-        assert os.path.isfile(localFile)
-        assert os.path.getsize(localFile) > 0
+        localFile = Path(client.cachepath) / client.state.file.MFileName
+        assert localFile.is_file()
+        assert localFile.stat().st_size > 0
 
     # Check that the client state and the saved state are the same
-    with open(localStateFile, 'r') as f:
+    with localStateFile.open() as f:
         stateFromFile = State(**json.load(f))
     assert stateFromFile.file == client.state.file
     assert stateFromFile.dataset == client.state.dataset
 
+def listdir_names(path) -> list[str]:
+    """Names of the entries in a directory (like os.listdir)."""
+    return [p.name for p in Path(path).iterdir()]
+
 def check_extra_files(extrafiles: list[File]):
-    assert len(os.listdir(mockdownloaddir)) == len(extrafiles)
+    downloaded = listdir_names(mockdownloaddir)
+    assert len(downloaded) == len(extrafiles)
     for file in extrafiles:
         assert file['ExtraFile']
-        assert file['MFileName'] in os.listdir(mockdownloaddir)
-        assert os.path.getsize(os.path.join(mockdownloaddir, file['MFileName'])) > 0
+        assert file['MFileName'] in downloaded
+        assert (Path(mockdownloaddir) / file['MFileName']).stat().st_size > 0
 
 def verify_files(files, key, regexs, func="match"):
     match = []
@@ -299,7 +305,6 @@ def strtobool (val):
     val = val.lower()
     if val in ('y', 'yes', 't', 'true', 'on', '1'):
         return 1
-    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+    if val in ('n', 'no', 'f', 'false', 'off', '0'):
         return 0
-    else:
-        raise ValueError("invalid truth value %r" % (val,))
+    raise ValueError(f"invalid truth value {val!r}")

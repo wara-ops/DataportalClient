@@ -1,43 +1,47 @@
-import os
-import pytest
-import json
-import pandas as pd
-import re
-import math
-import logging
+import gc
 import inspect
-
+import json
+import logging
+import math
+import os
+import pickle
+import re
 import urllib.parse
+import weakref
 from copy import deepcopy
+from pathlib import Path
 
+import pandas as pd
+import pytest
+import requests
+import zstandard
+from requests.exceptions import ChunkedEncodingError, HTTPError
+
+from src.dataportal.dataportalclient import ChunkedList, DataportalClient, Dataset, File, NoDatasetError, ParquetEngineMissingError, UnsupportedExtentionError
 from tests.settings import (
-    mockurl,
-    mockdsmetrics,
-    mockdslogs,
-    mockdserr,
-    mockdatasetids,
-    mockdatasets,
-    mockdatasetmap,
-    metricfilesext,
+    check_cache,
+    check_extra_files,
+    extrafiles,
+    listdir_names,
+    logfile_missingcomp,
     logfilesext,
+    metricfile_missingcomp,
+    metricfilesext,
+    mockdatasetids,
+    mockdatasetmap,
+    mockdatasets,
+    mockdatashapes,
+    mockdownloaddir,
+    mockdserr,
+    mockdslogs,
+    mockdsmetrics,
     mockfiles,
     mockfilesdir,
-    mockdownloaddir,
-    testfiles,
-    extrafiles,
-    metricfile_missingcomp,
-    logfile_missingcomp,
-    mockdatashapes,
     mocktoken,
-    check_cache,
+    mockurl,
     strtobool,
-    check_extra_files
+    testfiles,
 )
-
-from requests.exceptions import HTTPError, ChunkedEncodingError
-import zstandard
-
-from src.dataportal.dataportalclient import DataportalClient, NoDatasetError, UnsupportedExtentionError, ParquetEngineMissingError, Dataset, File, ChunkedList
 
 os.environ["DATAPORTAL_API"] = mockurl
 
@@ -47,13 +51,14 @@ def generate_testfiles():
     def readDF(filepath):
         if '.csv' in filepath:
             return pd.read_csv(filepath)
-        elif '.json' in filepath:
+        if '.json' in filepath:
             return pd.read_json(filepath, lines=True)
-        else:
-            raise UnsupportedExtentionError(filepath)
+        raise UnsupportedExtentionError(filepath)
 
-    def writeDF(df, filename, extraArgs={}):
-        filepath = os.path.join(mockfilesdir, filename)
+    def writeDF(df, filename, extraArgs=None):
+        if extraArgs is None:
+            extraArgs = {}
+        filepath = Path(mockfilesdir) / filename
         if '.pkl' in filename:
             df.to_pickle(filepath, **extraArgs)
         elif '.csv' in filename:
@@ -63,10 +68,10 @@ def generate_testfiles():
         else:
             df.to_json(filepath, **{'orient': 'records', 'lines': True, **extraArgs})
 
-    def genFilesFromDF(filepath, file_extensions, nocomp={}):
+    def genFilesFromDF(filepath, file_extensions, nocomp=None):
         df = readDF(filepath)
         col0 = df.columns[0]
-        filename = os.path.basename(filepath).split('.')[0]
+        filename = Path(filepath).name.split('.')[0]
         for fext in file_extensions:
             newfilename = filename + fext
             newdf = df.rename(columns={col0: newfilename})
@@ -78,12 +83,10 @@ def generate_testfiles():
 
     def createEmptyFiles(filenames: list[str]):
         for filename in filenames:
-            with open(os.path.join(mockfilesdir, filename), 'w') as fp:
+            with (Path(mockfilesdir) / filename).open('w') as fp:
                 fp.write(f'This is extrafile {filename}')
-                pass
 
-    if not os.path.isdir(mockfilesdir):
-        os.mkdir(mockfilesdir)
+    Path(mockfilesdir).mkdir(exist_ok=True)
 
     genFilesFromDF(testfiles['metric'], metricfilesext, metricfile_missingcomp)
     genFilesFromDF(testfiles['log'], logfilesext, logfile_missingcomp)
@@ -113,18 +116,20 @@ class MockedResponse:
             raise ValueError('No file loaded')
 
     def __enter__(self):
-        self.file = open(self.filename, 'rb')
+        self.file = Path(self.filename).open('rb')
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.file.close()
-        return None
+        return
 
 @pytest.fixture(autouse=True)
 def mocked_responses(mocker):
     mockresp = MockedResponse()
 
-    def mockfunc(url, headers={}, stream=False):
+    def mockfunc(url, headers=None, stream=False):
+        if headers is None:
+            headers = {}
 
         urlParts = urllib.parse.urlparse(url)
         if headers["Authorization"].split(' ')[-1] != mocktoken:
@@ -206,24 +211,24 @@ def mocked_responses(mocker):
                 filename = file['MFileName']
             except StopIteration:
                 mockresp.status_code = 404
-                raise HTTPError(response=mockresp)
+                raise HTTPError(response=mockresp) from None
             except Exception as e:
                 print("error: get content, ", e)
                 mockresp.status_code = 500
-                raise HTTPError(response=mockresp)
+                raise HTTPError(response=mockresp) from e
 
             if (datasetid == mockdatasetids[mockdserr]):
                 if file['OriginName'] == 'HTTPError':
                     raise HTTPError
-                elif file['OriginName'] == 'ChunkedEncodingError1' and mockresp.calls[(datasetid, fileid)] == 1:
+                if file['OriginName'] == 'ChunkedEncodingError1' and mockresp.calls[(datasetid, fileid)] == 1:
                     raise ChunkedEncodingError
-                elif file['OriginName'] == 'ChunkedEncodingErrorX':
+                if file['OriginName'] == 'ChunkedEncodingErrorX':
                     raise ChunkedEncodingError
-                elif file['OriginName'] == 'Exception':
+                if file['OriginName'] == 'Exception':
                     raise Exception('mocked exception')
 
             mockresp.headers = {"Content-disposition": "filename=" + filename}
-            mockresp.filename = os.path.join(mockfilesdir, filename)
+            mockresp.filename = str(Path(mockfilesdir) / filename)
 
             print(mockresp.filename)
             print(mockresp.calls)
@@ -339,22 +344,22 @@ class TestDownloadFile:
 
     @pytest.fixture(scope="class", autouse=True)
     def cleanMockDownloadDir(self):
-        if os.path.isdir(mockdownloaddir):
+        if Path(mockdownloaddir).is_dir():
             dsfilenames = [file['MFileName'] for file in mockfiles[mockdatasetids[mockdserr]]]
-            for filename in os.listdir(mockdownloaddir):
+            for filename in listdir_names(mockdownloaddir):
                 if filename in dsfilenames:
-                    os.remove(os.path.join(mockdownloaddir, filename))
+                    (Path(mockdownloaddir) / filename).unlink()
         else:
-            os.mkdir(mockdownloaddir)
+            Path(mockdownloaddir).mkdir()
 
     def test_download_file(self, client: DataportalClient):
         file = next(filter(lambda o: o['OriginName'] == 'thisworks', client.listFiles()))
 
         client._downloadFile(file['FileID'], mockdownloaddir)
 
-        assert len(os.listdir(mockdownloaddir)) > 0
-        assert file['MFileName'] in os.listdir(mockdownloaddir)
-        assert os.path.getsize(os.path.join(mockdownloaddir, file['MFileName'])) > 0
+        assert len(listdir_names(mockdownloaddir)) > 0
+        assert file['MFileName'] in listdir_names(mockdownloaddir)
+        assert (Path(mockdownloaddir) / file['MFileName']).stat().st_size > 0
 
 
     def test_download_file_retries(self, client: DataportalClient, caplog):
@@ -368,15 +373,15 @@ class TestDownloadFile:
             strmatch = f'Connection failed (1/{client.reconnectAttemps}), retrying...'
             assert strmatch in caplog.text
 
-            assert len(os.listdir(mockdownloaddir)) > 0
-            assert file['MFileName'] in os.listdir(mockdownloaddir)
-            assert os.path.getsize(os.path.join(mockdownloaddir, file['MFileName'])) > 0
+            assert len(listdir_names(mockdownloaddir)) > 0
+            assert file['MFileName'] in listdir_names(mockdownloaddir)
+            assert (Path(mockdownloaddir) / file['MFileName']).stat().st_size > 0
 
     def test_download_file_too_many_retries(self, client: DataportalClient, caplog):
         with caplog.at_level(logging.INFO):
             file = next(filter(lambda o: o['OriginName'] == 'ChunkedEncodingErrorX', client.listFiles()))
 
-            with pytest.raises(Exception):
+            with pytest.raises(Exception, match="ChunkedEncodingError"):
                 client._downloadFile(file['FileID'], mockdownloaddir)
 
             # assert that all recconection attempts have been made
@@ -384,7 +389,7 @@ class TestDownloadFile:
             assert strmatch in caplog.text
 
             # file has not been downloaded
-            assert file['MFileName'] not in os.listdir(mockdownloaddir)
+            assert file['MFileName'] not in listdir_names(mockdownloaddir)
 
     def test_download_file_general_exception_handling(self, client: DataportalClient):
         file = next(filter(lambda o: o['OriginName'] == 'Exception', client.listFiles()))
@@ -396,7 +401,7 @@ class TestDownloadFile:
         assert str(e.value) == 'mocked exception'
 
         # file has not been downloaded
-        assert file['MFileName'] not in os.listdir(mockdownloaddir)
+        assert file['MFileName'] not in listdir_names(mockdownloaddir)
 
 
 class TestCacheDataFile:
@@ -447,12 +452,12 @@ class TestCacheDataFile:
         assert File(**json.loads(df.model_dump_json())) == client_preloaded.state.file
 
     def test_client_clean_state(self, client_preloaded: DataportalClient):
-        assert len(os.listdir(client_preloaded.cachepath)) == 2
+        assert len(listdir_names(client_preloaded.cachepath)) == 2
 
         client_clean = DataportalClient(mocktoken, cleanStart=True)
         assert client_clean.state.dataset is None
         assert client_clean.state.file is None
-        assert len(os.listdir(client_preloaded.cachepath)) == 0
+        assert len(listdir_names(client_preloaded.cachepath)) == 0
 
     def test_error_during_download_resets_file(self, client_clean: DataportalClient):
         # Load initial state
@@ -493,7 +498,7 @@ class TestGetData:
         extrafile = next(filter(lambda o: o['ExtraFile'], client_clean.listFiles(extraFiles=True)))
         with pytest.raises(ValueError):
             client_clean.getData(extrafile['FileID'])
-        assert len(os.listdir(client_clean.cachepath)) == 0
+        assert len(listdir_names(client_clean.cachepath)) == 0
         assert client_clean.state.file is None
 
 
@@ -607,17 +612,17 @@ class TestGetExtrafiles:
 
     @pytest.fixture(autouse=True)
     def cleanMockDownloadDir(self):
-        if os.path.isdir(mockdownloaddir):
+        if Path(mockdownloaddir).is_dir():
             dsfilenames = [file['MFileName'] for file in mockfiles[mockdatasetids[mockdsmetrics]]]
-            for filename in os.listdir(mockdownloaddir):
+            for filename in listdir_names(mockdownloaddir):
                 if filename in dsfilenames:
-                    os.remove(os.path.join(mockdownloaddir, filename))
+                    (Path(mockdownloaddir) / filename).unlink()
         else:
-            os.mkdir(mockdownloaddir)
+            Path(mockdownloaddir).mkdir()
 
     @pytest.fixture(autouse=True)
     def returnToTestDir(self):
-        testdir = os.getcwd()
+        testdir = Path.cwd()
         yield
         os.chdir(testdir)
 
@@ -637,8 +642,8 @@ class TestGetExtrafiles:
         try:
             ef1 = next(extrafiles)
             ef2 = next(extrafiles)
-        except StopIteration:
-            raise ValueError('need atleast 2 extrafiles in selected dataset for this test')
+        except StopIteration as e:
+            raise ValueError('need atleast 2 extrafiles in selected dataset for this test') from e
 
         client.getExtraFiles([ef1['FileID'], f"{ef2['FileID']}"])
         check_extra_files([ef1, ef2])
@@ -670,7 +675,7 @@ class TestGetExtrafiles:
         assert str(e.value) == client._errTextNoFile(Dataset(**mockdatasetmap[mockdsmetrics]), nonexistent_id)
 
         # No file downloaded
-        assert len(os.listdir(mockdownloaddir)) == 1
+        assert len(listdir_names(mockdownloaddir)) == 1
 
     def test_download_extrafile_raise_error_on_datafile(self, client: DataportalClient):
         os.chdir(mockdownloaddir)
@@ -681,7 +686,7 @@ class TestGetExtrafiles:
             raise failures[datafile['FileID']]
 
         # No file downloaded
-        assert len(os.listdir(mockdownloaddir)) == 0
+        assert len(listdir_names(mockdownloaddir)) == 0
 
     def test_download_extrafile_bad_string(self, client: DataportalClient):
         os.chdir(mockdownloaddir)
@@ -690,13 +695,13 @@ class TestGetExtrafiles:
             ids, failures = client.getExtraFiles("hej")
 
         # No file downloaded
-        assert len(os.listdir(mockdownloaddir)) == 0
+        assert len(listdir_names(mockdownloaddir)) == 0
 
         with pytest.raises(ValueError):
             ids, failures = client.getExtraFiles(["hej"])
 
         # No file downloaded
-        assert len(os.listdir(mockdownloaddir)) == 0
+        assert len(listdir_names(mockdownloaddir)) == 0
 
 
 class TestGetDataParquet:
@@ -718,7 +723,7 @@ class TestGetDataParquet:
         added = []
 
         def add(filename: str, content: bytes):
-            with open(os.path.join(mockfilesdir, filename), 'wb') as f:
+            with (Path(mockfilesdir) / filename).open('wb') as f:
                 f.write(content)
             fileid = max(fo['FileID'] for fl in mockfiles.values() for fo in fl) + 1
             fileentry = {
@@ -740,7 +745,7 @@ class TestGetDataParquet:
 
         for fileentry in added:
             mockds.remove(fileentry)
-            os.remove(os.path.join(mockfilesdir, fileentry['MFileName']))
+            (Path(mockfilesdir) / fileentry['MFileName']).unlink()
 
     @staticmethod
     def parquetbytes(df, tmp_path, **kwargs):
@@ -827,3 +832,159 @@ class TestGetDataParquet:
             client_clean.getData(fileid)
         assert 'pip install pyarrow' in str(e.value)
         assert 'noengine.parquet.zst' in str(e.value)
+
+
+def _response(status=200, payload=None):
+    """A real requests.Response, so raise_for_status() raises an HTTPError carrying .response."""
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = json.dumps(payload if payload is not None else {}).encode()
+    return resp
+
+
+_PAGE = {
+    "data": [{"FileID": 1}],
+    "pagination": {"total_records": 1, "next_page": {}, "current_page": {"index": 1}},
+}
+
+
+class TestChunkedListContract:
+    URL = "http://chunked.test"
+    PATH = "files"
+
+    @pytest.fixture
+    def get(self, mocker):
+        """Replaces Session.get (overriding the autouse fixture); tests set .side_effect."""
+        return mocker.patch("requests.Session.get")
+
+    def make(self, **kwargs):
+        return ChunkedList(self.URL, self.PATH, mocktoken, **kwargs)
+
+    # --- __getitem__ ---
+    # The contract is ONE request: the portal's single-file route returns datafiles and
+    # extrafiles alike and accepts no extrafile parameter (both spellings answer 400), so
+    # the old 404-retry with ?extrafile=true could only ever produce a 400, which the old
+    # code swallowed -- returning None for a missing FileID and leaving the KeyError below
+    # unreachable. These tests pin the one-request contract down.
+
+    def test_missing_id_keyerror_contains_actual_id(self, get):
+        get.side_effect = [_response(404)]
+        with pytest.raises(KeyError) as e:
+            self.make()[4242]
+        assert "4242" in str(e.value)
+        assert "{index}" not in str(e.value)
+
+    def test_missing_id_does_not_retry_with_an_invalid_parameter(self, get):
+        # The retry sent ?extrafile=true, which the portal rejects with 400. A second
+        # request here means the dead fallback is back.
+        get.side_effect = [_response(404)]
+        with pytest.raises(KeyError):
+            self.make()[4242]
+        assert get.call_count == 1
+        assert "extrafile" not in get.call_args.args[0]
+
+    def test_non_404_raises_httperror_and_never_returns_none(self, get):
+        # The old code let a non-404 fall off the end of __getitem__ and returned None.
+        get.side_effect = [_response(500)]
+        with pytest.raises(HTTPError) as e:
+            self.make()[7]
+        assert e.value.response.status_code == 500
+        assert get.call_count == 1
+
+    def test_datafile_is_returned_in_one_request(self, get):
+        get.side_effect = [_response(200, {"FileID": 7})]
+        assert self.make()[7] == {"FileID": 7}
+        assert get.call_count == 1
+        assert "extrafile" not in get.call_args.args[0]
+
+    def test_extrafile_is_returned_by_the_same_route(self, get):
+        # Verified against the portal: the plain route answers 200 for an extrafile id.
+        get.side_effect = [_response(200, {"FileID": 7, "OriginName": "extrafile"})]
+        assert self.make()[7] == {"FileID": 7, "OriginName": "extrafile"}
+        assert get.call_count == 1
+
+    # --- constructor ---
+
+    def test_default_constructor_works_and_orders_by_fileid(self, get):
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        cl = ChunkedList(self.URL, self.PATH, mocktoken)
+        assert cl.getCount() == 1
+        assert "order_by=FileID" in get.call_args.args[0]
+
+    def test_invalid_arguments_raise_valueerror(self):
+        with pytest.raises(ValueError, match="orderBy must be one of"):
+            self.make(orderBy="Bogus")
+        with pytest.raises(ValueError, match="orderBy must be one of"):
+            self.make(orderBy=None)
+        with pytest.raises(ValueError, match="sort must be one of"):
+            self.make(sort="sideways")
+
+    # --- per-instance cache ---
+
+    def test_instance_is_garbage_collected_after_cached_request(self, get):
+        # Regression test for the class-level lru_cache leak: this test FAILS with the old
+        # class-level cache (the cache, a GC root, keyed on and so retained every instance).
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        cl = self.make()
+        cl.getCount()
+        assert get.call_count == 1
+        ref = weakref.ref(cl)
+        del cl
+        gc.collect()
+        assert ref() is None
+
+    def test_caches_are_isolated_between_instances(self, get):
+        # Invariant, NOT a regression test: the old class-level cache already keyed on `self`,
+        # so instances never shared entries -- measured, this passes on the pre-fix code too.
+        # It is kept so the per-instance rewrite cannot accidentally introduce sharing.
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        first, second = self.make(), self.make()
+        first.getCount()
+        second.getCount()
+        assert get.call_count == 2
+
+    def test_pickle_round_trip_survives_the_per_instance_cache(self, get):
+        # The cache is a live lru_cache wrapper in __dict__, which pickle cannot serialise.
+        # Pickling worked before the cache moved onto the instance, so __getstate__/__setstate__
+        # drop and rebuild it; without them this raises PicklingError.
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        cl = self.make()
+        cl.getCount()
+        restored = pickle.loads(pickle.dumps(cl))
+        assert restored.getCount() == _PAGE["pagination"]["total_records"]
+        # the rebuilt instance must be a fully working, registered, collectable one
+        assert hasattr(restored._sendRequest, "cache_clear")
+        assert restored in ChunkedList._instances
+        ref = weakref.ref(restored)
+        del restored
+        gc.collect()
+        assert ref() is None
+
+    def test_same_request_on_one_instance_is_cached(self, get):
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        cl = self.make()
+        cl._sendRequest("files", query={"a": 1})
+        cl._sendRequest("files", query={"a": 1})
+        assert get.call_count == 1
+
+    def test_cache_clear_class_and_instance(self, get):
+        get.side_effect = lambda *a, **k: _response(200, _PAGE)
+        cl = self.make()
+        other = self.make()
+        for inst in (cl, other):
+            inst._sendRequest("files", query={"a": 1})
+        assert get.call_count == 2
+
+        assert callable(ChunkedList._sendRequest.cache_clear)
+        ChunkedList._sendRequest.cache_clear()
+        for inst in (cl, other):
+            inst._sendRequest("files", query={"a": 1})
+        assert get.call_count == 4  # both live instances were cleared
+
+        cl._sendRequest("files", query={"a": 1})
+        assert get.call_count == 4  # cached again
+        cl._sendRequest.cache_clear()
+        cl._sendRequest("files", query={"a": 1})
+        assert get.call_count == 5
+        other._sendRequest("files", query={"a": 1})
+        assert get.call_count == 5  # instance clear did not touch the other instance
