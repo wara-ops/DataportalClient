@@ -1,6 +1,8 @@
 import json
 import logging
+import numbers
 import os
+import tarfile
 import tempfile
 import time
 from datetime import datetime
@@ -19,6 +21,47 @@ _logger = get_logger()
 
 _PARQUET_MAGIC = b"PAR1"
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+# First bytes of the compression formats pandas can read (read_pickle/read_csv/read_json), mapped to
+# the name pandas expects in `compression=`. Used to detect compression from the content, because
+# pandas only infers it from the file extension and the portal's file names are not reliable.
+_COMPRESSION_MAGICS = (
+    (b"BZh", "bz2"),
+    (b"\x1f\x8b", "gzip"),
+    (b"\xfd7zXZ\x00", "xz"),
+    (_ZSTD_MAGIC, "zstd"),
+    (b"PK\x03\x04", "zip"),
+)
+_BZ2_LEVELS = tuple(str(i).encode() for i in range(1, 10))
+
+
+def _sniffCompression(datafile: str) -> str | None:
+    """Returns the pandas compression name ('bz2', 'gzip', 'xz', 'zstd', 'zip' or 'tar') matching the
+    content of datafile, or None if it does not look compressed (or archived)."""
+    # A tar archive, plain or wrapped in gzip/bz2/xz (pandas reads these as compression='tar' and
+    # infers it from names like '.csv.tar.gz'), must be recognised before the outer wrapper is, or
+    # pandas would hand the raw tar stream to the parser.
+    try:
+        if tarfile.is_tarfile(datafile):
+            return "tar"
+    except Exception:  # noqa: BLE001 - e.g. a truncated gzip/xz stream raises EOFError; fall back to the magic bytes
+        pass
+    with Path(datafile).open("rb") as f:
+        head = f.read(8)
+    for magic, name in _COMPRESSION_MAGICS:
+        if head.startswith(magic):
+            # a bz2 stream is 'BZh' followed by the block size digit '1'..'9'; checking it avoids
+            # mistaking a plain text file that happens to start with 'BZh' for bz2
+            if name == "bz2" and head[3:4] not in _BZ2_LEVELS:
+                continue
+            return name
+    return None
+
+
+def _validateEntries(entries) -> None:
+    """entries must be an integer >= 1 (chunk size) or -1 (read everything)."""
+    if isinstance(entries, bool) or not isinstance(entries, numbers.Integral) or (entries < 1 and entries != -1):
+        raise ValueError(f"entries must be an integer >= 1, or -1 to read all entries, got {entries!r}")
 
 # TODO:
 #   Update listFiles to include general index, orderBy and sortBy
@@ -296,22 +339,47 @@ class DataportalClient:
         return parseParquet()
 
     # Creates a pandas dataframe generator from the selected datafile.
+    # entries is a chunk size >= 1, or -1 for the whole file as one dataframe (validated in getData).
+    # Compression is detected from the file's first bytes (pandas only looks at the file extension),
+    # unless the caller passes compression= explicitly, which is then used as is (even None).
     def _partiallyParseData(self, datafile: str, entries: int, **extraArgs):
+        name = self.state.file.MFileName
+
+        if ".parquet" in name:
+            return self._parseParquet(datafile, **extraArgs)
+
+        if "compression" not in extraArgs:
+            detected = _sniffCompression(datafile)
+            _logger.debug("detected compression %s for %s", detected, name)
+            if detected is not None:
+                extraArgs["compression"] = detected
+
         def parsePickle():
             yield pd.read_pickle(datafile, **extraArgs)
 
-        if ".parquet" in self.state.file.MFileName:
-            return self._parseParquet(datafile, **extraArgs)
-        if ".pkl" in self.state.file.MFileName:
+        def parseWhole(read):
+            # entries == -1: the whole file as a single dataframe, wrapped to also work as a generator
+            df = read(datafile, **extraArgs)
+            return (d for d in (df,))
+
+        def parseChunked(read):
+            return read(datafile, chunksize=entries, **extraArgs)
+
+        def readJson(path, **kwargs):
+            return pd.read_json(path, lines=True, **kwargs)
+
+        parse = parseWhole if entries == -1 else parseChunked
+
+        if ".pkl" in name:
             return parsePickle()
-        if ".csv" in self.state.file.MFileName:
-            return pd.read_csv(datafile, chunksize=entries, **extraArgs)
-        if ".json" in self.state.file.MFileName:
-            return pd.read_json(datafile, chunksize=entries, lines=True, **extraArgs)
+        if ".csv" in name:
+            return parse(pd.read_csv)
+        if ".json" in name:
+            return parse(readJson)
         try:  # if can be parsed as json, do so
-            return pd.read_json(datafile, chunksize=entries, lines=True, **extraArgs)
+            return parse(readJson)
         except Exception as e:
-            raise UnsupportedExtentionError(f"file {self.state.file.MFileName} can not be parsed") from e
+            raise UnsupportedExtentionError(f"file {name} can not be parsed") from e
 
     # Performs a requests to the API with the given path and query parameters
     def _sendRequest(self, path: str, query: dict | None = None, stream=False):
@@ -449,6 +517,13 @@ class DataportalClient:
             .parquet (also .parquet.zst, .zstd.parquet, ...)
                 pandas.read_parquet(file, **extraArgs)
 
+            Notes on compression: pandas only infers the compression of .pkl/.csv/.json files from the
+            file extension, which is unreliable on the portal (e.g. bz2-compressed pickles named '*.pkl',
+            zstd ones named '*.pkl.zstd'). The compression (bz2, gzip, xz, zstd, zip, or a tar archive) is therefore
+            detected from the file's first bytes and passed to pandas; plain files are read as before.
+            Pass compression=... (any value, including None) to override the detection. Parquet files
+            ignore compression, see below.
+
             Notes on parquet: the portal's MQTT ingester writes files named '*.parquet.zst', but these
             are plain parquet files (zstd is only the compression of the columns inside), not
             zstd-wrapped ones. The format is therefore detected from the file's first bytes rather than
@@ -464,15 +539,17 @@ class DataportalClient:
                 error will be raised.
             entries : int, optional
                 the number of entries to be included in the dataframe. Only valid for chunkable file formats,
-                e.g. not .pkl or .parquet files. If set to -1, all entries will be read. Use this at your own risk for
-                larger files. Defaults to 100000.
+                e.g. not .pkl or .parquet files. Must be an integer >= 1, or -1: all entries are read into one
+                dataframe (with generator=True, a generator yielding that single dataframe). Use -1 at your own
+                risk for larger files. Any other value raises ValueError. Defaults to 100000.
             generator : bool, optional
                 if a generator of dataframes over the data should be returned. This allows for iterating over
                 all data in the file without loading it all into memory. Each subsequent dataframe yields the
                 next "entries" number of data points. If false, the returned dataframe will include the first
                 "entries" number of data points. Defaults to False.
             extraArgs : optional key-value arguments as (if) required
-                extra arguments to pass to pandas when loading the file.
+                extra arguments to pass to pandas when loading the file. An explicit compression=... takes
+                precedence over the automatic compression detection.
 
             Returns
             -------
@@ -480,6 +557,8 @@ class DataportalClient:
         """
 
         self._isDatasetLoaded()
+
+        _validateEntries(entries)
 
         if fileID == "":
             if self.state.file is None:

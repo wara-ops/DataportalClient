@@ -1,4 +1,5 @@
 import gc
+import gzip
 import inspect
 import json
 import logging
@@ -6,6 +7,7 @@ import math
 import os
 import pickle
 import re
+import tarfile
 import urllib.parse
 import weakref
 from copy import deepcopy
@@ -17,7 +19,7 @@ import requests
 import zstandard
 from requests.exceptions import ChunkedEncodingError, HTTPError
 
-from src.dataportal.dataportalclient import ChunkedList, DataportalClient, Dataset, File, NoDatasetError, ParquetEngineMissingError, UnsupportedExtentionError
+from src.dataportal.dataportalclient import ChunkedList, DataportalClient, Dataset, File, NoDatasetError, ParquetEngineMissingError, UnsupportedExtentionError, _sniffCompression
 from tests.settings import (
     check_cache,
     check_extra_files,
@@ -832,6 +834,270 @@ class TestGetDataParquet:
             client_clean.getData(fileid)
         assert 'pip install pyarrow' in str(e.value)
         assert 'noengine.parquet.zst' in str(e.value)
+
+
+@pytest.fixture
+def addmockfile():
+    """Writes a file into the mock file directory and temporarily registers it in the metrics dataset listing."""
+    mockds = mockfiles[mockdatasetids[mockdsmetrics]]
+    added = []
+
+    def add(filename: str, content: bytes):
+        with (Path(mockfilesdir) / filename).open('wb') as f:
+            f.write(content)
+        fileid = max(fo['FileID'] for fl in mockfiles.values() for fo in fl) + 1
+        fileentry = {
+            "FileID": fileid,
+            "MFileName": filename,
+            "OriginName": 'somedatasource',
+            "StartDate": '2026-10-06T00:00:00Z',
+            "StopDate": '2026-10-07T00:00:00Z',
+            "FileSize": len(content),
+            "MetricEntries": 7,
+            "MetricType": 'float',
+            "ExtraFile": False
+        }
+        mockds.append(fileentry)
+        added.append(fileentry)
+        return fileid
+
+    yield add
+
+    for fileentry in added:
+        mockds.remove(fileentry)
+        (Path(mockfilesdir) / fileentry['MFileName']).unlink()
+
+
+_COMPRESSION_DF = pd.DataFrame({
+    'ts': pd.date_range('2026-10-06T09:10:32', periods=7, freq='s'),
+    'value': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+    'topic': ['a', 'b', 'c', 'a', 'b', 'c', 'a'],
+})
+
+
+class TestGetDataEntries:
+    """entries=-1 reads the whole file, other values below 1 are rejected, positive values chunk."""
+
+    df = _COMPRESSION_DF
+
+    @pytest.fixture(params=['csv', 'json'])
+    def fileid(self, request, client_clean: DataportalClient, addmockfile):
+        if request.param == 'csv':
+            content = self.df.to_csv(index=False).encode()
+            fileid = addmockfile('entries_all.csv', content)
+        else:
+            content = self.df.to_json(orient='records', lines=True, date_format='iso').encode()
+            fileid = addmockfile('entries_all.json', content)
+        client_clean.fromDataset(mockdsmetrics)
+        return fileid
+
+    def test_all_entries_dataframe(self, client_clean: DataportalClient, fileid):
+        df = client_clean.getData(fileid, entries=-1)
+        assert isinstance(df, pd.DataFrame)
+        assert df.shape == self.df.shape
+        assert list(df['value']) == list(self.df['value'])
+        check_cache(client_clean)
+
+    def test_all_entries_generator(self, client_clean: DataportalClient, fileid):
+        dfgen = client_clean.getData(fileid, entries=-1, generator=True)
+        assert inspect.isgenerator(dfgen)
+        dfs = list(dfgen)
+        assert len(dfs) == 1
+        assert dfs[0].shape == self.df.shape
+        assert list(dfs[0]['topic']) == list(self.df['topic'])
+
+    def test_all_entries_with_extraargs(self, client_clean: DataportalClient, fileid):
+        assert len(client_clean.getData(fileid, entries=-1, nrows=2)) == 2
+
+    @pytest.mark.parametrize("entries", [0, -2, -100, 1.5, 3.0, '3', None, True])
+    def test_invalid_entries_rejected(self, client_clean: DataportalClient, fileid, entries):
+        with pytest.raises(ValueError) as e:
+            client_clean.getData(fileid, entries=entries)
+        assert '>= 1' in str(e.value)
+        assert '-1' in str(e.value)
+
+    @pytest.mark.parametrize("entries", [0, -2])
+    def test_invalid_entries_rejected_before_download(self, client_clean: DataportalClient, addmockfile, entries):
+        fileid = addmockfile('entries_nodl.csv', self.df.to_csv(index=False).encode())
+        client_clean.fromDataset(mockdsmetrics)
+        with pytest.raises(ValueError):
+            client_clean.getData(fileid, entries=entries)
+        assert len(listdir_names(client_clean.cachepath)) == 0
+        assert client_clean.state.file is None
+
+    def test_positive_entries_chunk(self, client_clean: DataportalClient, fileid):
+        df = client_clean.getData(fileid, entries=3)
+        assert df.shape[0] == 3
+
+        sizes = [len(d) for d in client_clean.getData(fileid, entries=3, generator=True)]
+        assert sizes == [3, 3, 1]
+
+    def test_positive_entries_larger_than_file(self, client_clean: DataportalClient, fileid):
+        assert len(client_clean.getData(fileid, entries=1000)) == len(self.df)
+
+    def test_all_entries_unknown_extension_json_fallback(self, client_clean: DataportalClient, addmockfile):
+        fileid = addmockfile('entries_noext', self.df.to_json(orient='records', lines=True, date_format='iso').encode())
+        client_clean.fromDataset(mockdsmetrics)
+        dfs = list(client_clean.getData(fileid, entries=-1, generator=True))
+        assert len(dfs) == 1
+        assert len(dfs[0]) == len(self.df)
+
+    def test_all_entries_unknown_extension_unparsable(self, client_clean: DataportalClient, addmockfile):
+        fileid = addmockfile('entries_garbage', b'this is not json\nat all')
+        client_clean.fromDataset(mockdsmetrics)
+        with pytest.raises(UnsupportedExtentionError):
+            client_clean.getData(fileid, entries=-1)
+
+    def test_pickle_ignores_entries(self, client_clean: DataportalClient, addmockfile, tmp_path):
+        path = tmp_path / 'x.pkl'
+        self.df.to_pickle(path)
+        fileid = addmockfile('entries_pickle.pkl', path.read_bytes())
+        client_clean.fromDataset(mockdsmetrics)
+        pd.testing.assert_frame_equal(client_clean.getData(fileid, entries=-1), self.df)
+
+
+class TestGetDataCompressionDetection:
+    """Compression is detected from the first bytes, whatever the file is named."""
+
+    df = _COMPRESSION_DF
+
+    @staticmethod
+    def pickled(df, tmp_path, compression):
+        path = tmp_path / 'written.pkl'
+        df.to_pickle(path, compression=compression)
+        return path.read_bytes()
+
+    @pytest.mark.parametrize("compression, magic", [
+        ('bz2', b'BZh'),
+        ('gzip', b'\x1f\x8b'),
+        ('xz', b'\xfd7zXZ\x00'),
+        ('zstd', b'\x28\xb5\x2f\xfd'),
+        ('zip', b'PK\x03\x04'),
+        (None, b'\x80'),
+    ])
+    def test_pickle_named_pkl(self, client_clean: DataportalClient, addmockfile, tmp_path, compression, magic):
+        content = self.pickled(self.df, tmp_path, compression)
+        assert content.startswith(magic)
+        fileid = addmockfile(f'history_{compression}.pkl', content)
+
+        client_clean.fromDataset(mockdsmetrics)
+        pd.testing.assert_frame_equal(client_clean.getData(fileid), self.df)
+        check_cache(client_clean)
+
+    def test_pickle_zstd_named_pkl_zstd(self, client_clean: DataportalClient, addmockfile, tmp_path):
+        # pandas only maps '.zst', so this name used to give 'pickle data was truncated'
+        fileid = addmockfile('history_zstdname.pkl.zstd', self.pickled(self.df, tmp_path, 'zstd'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        pd.testing.assert_frame_equal(client_clean.getData(fileid), self.df)
+
+    def test_pickle_generator(self, client_clean: DataportalClient, addmockfile, tmp_path):
+        fileid = addmockfile('history_gen.pkl', self.pickled(self.df, tmp_path, 'bz2'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        dfs = list(client_clean.getData(fileid, generator=True))
+        assert len(dfs) == 1
+        pd.testing.assert_frame_equal(dfs[0], self.df)
+
+    def test_explicit_compression_is_honoured(self, client_clean: DataportalClient, addmockfile, tmp_path):
+        fileid = addmockfile('explicit.pkl', self.pickled(self.df, tmp_path, 'bz2'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        # the matching explicit value works (the tutorials do this)
+        pd.testing.assert_frame_equal(client_clean.getData(fileid, compression='bz2'), self.df)
+        # a wrong explicit value is NOT overridden by the detection: bz2 data read as gzip fails
+        with pytest.raises(OSError):
+            client_clean.getData(fileid, compression='gzip')
+        # nor is an explicit None: the compressed bytes are handed to pickle as they are
+        with pytest.raises(pickle.UnpicklingError):
+            client_clean.getData(fileid, compression=None)
+
+    def test_explicit_compression_passed_to_pandas_unchanged(self, client_clean: DataportalClient, addmockfile, tmp_path, mocker):
+        fileid = addmockfile('passthrough.pkl', self.pickled(self.df, tmp_path, 'bz2'))
+        spy = mocker.patch('pandas.read_pickle', return_value=self.df)
+
+        client_clean.fromDataset(mockdsmetrics)
+        client_clean.getData(fileid, compression=None)
+        assert spy.call_args.kwargs == {'compression': None}
+        client_clean.getData(fileid)
+        assert spy.call_args.kwargs == {'compression': 'bz2'}
+
+    def test_plain_file_gets_no_compression_argument(self, client_clean: DataportalClient, addmockfile, tmp_path, mocker):
+        fileid = addmockfile('plain.pkl', self.pickled(self.df, tmp_path, None))
+        spy = mocker.patch('pandas.read_pickle', return_value=self.df)
+
+        client_clean.fromDataset(mockdsmetrics)
+        client_clean.getData(fileid)
+        assert spy.call_args.kwargs == {}
+
+    def test_logs_detected_compression(self, client_clean: DataportalClient, addmockfile, tmp_path, caplog):
+        fileid = addmockfile('logged.pkl', self.pickled(self.df, tmp_path, 'bz2'))
+
+        client_clean.fromDataset(mockdsmetrics)
+        with caplog.at_level(logging.DEBUG, logger='dataportal.dataportalclient'):
+            client_clean.getData(fileid)
+        assert any('detected compression bz2' in r.getMessage() and r.levelno == logging.DEBUG for r in caplog.records)
+
+    @pytest.mark.parametrize("mode", ['w', 'w:gz', 'w:bz2', 'w:xz'])
+    def test_tar_archived_csv_named_csv(self, client_clean: DataportalClient, addmockfile, tmp_path, mode):
+        # pandas reads (compressed) tar archives with compression='tar', not with the outer codec
+        src = tmp_path / 'inner.csv'
+        src.write_bytes(self.df.to_csv(index=False).encode())
+        archive = tmp_path / 'archive'
+        with tarfile.open(archive, mode) as tf:
+            tf.add(src, arcname='inner.csv')
+        fileid = addmockfile('archived.csv', archive.read_bytes())
+
+        client_clean.fromDataset(mockdsmetrics)
+        assert client_clean.getData(fileid).shape == self.df.shape
+
+    def test_gzip_csv_named_csv(self, client_clean: DataportalClient, addmockfile):
+        content = gzip.compress(self.df.to_csv(index=False).encode())
+        fileid = addmockfile('compressed.csv', content)
+
+        client_clean.fromDataset(mockdsmetrics)
+        df = client_clean.getData(fileid)
+        assert df.shape == self.df.shape
+        assert list(df['topic']) == list(self.df['topic'])
+        assert [len(d) for d in client_clean.getData(fileid, entries=3, generator=True)] == [3, 3, 1]
+        assert len(client_clean.getData(fileid, entries=-1)) == len(self.df)
+
+    @pytest.mark.parametrize("compression", ['bz2', 'xz', 'zstd'])
+    def test_compressed_json_lines_named_json(self, client_clean: DataportalClient, addmockfile, tmp_path, compression):
+        path = tmp_path / f'written.{compression}'
+        self.df.to_json(path, orient='records', lines=True, date_format='iso', compression=compression)
+        fileid = addmockfile(f'compressed_{compression}.json', path.read_bytes())
+
+        client_clean.fromDataset(mockdsmetrics)
+        assert client_clean.getData(fileid).shape == self.df.shape
+        assert client_clean.getData(fileid, entries=-1).shape == self.df.shape
+
+    def test_parquet_still_drops_compression_with_warning(self, client_clean: DataportalClient, addmockfile, tmp_path, caplog):
+        path = tmp_path / 'p.parquet'
+        self.df.to_parquet(path)
+        fileid = addmockfile('compressed_arg.parquet', path.read_bytes())
+
+        client_clean.fromDataset(mockdsmetrics)
+        with caplog.at_level(logging.WARNING, logger='dataportal.dataportalclient'):
+            df = client_clean.getData(fileid, compression='bz2')
+        pd.testing.assert_frame_equal(df, self.df)
+        assert any('ignoring compression' in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("head, expected", [
+        (b'BZh91AY&SY', 'bz2'),
+        (b'BZh,not,bz2', None),
+        (b'BZh', None),
+        (b'\x1f\x8b\x08', 'gzip'),
+        (b'\xfd7zXZ\x00\x00', 'xz'),
+        (b'\x28\xb5\x2f\xfd\x00', 'zstd'),
+        (b'PK\x03\x04', 'zip'),
+        (b'a,b,c\n1,2,3\n', None),
+        (b'', None),
+    ])
+    def test_sniff_compression(self, tmp_path, head, expected):
+        path = tmp_path / 'f'
+        path.write_bytes(head)
+        assert _sniffCompression(str(path)) == expected
 
 
 def _response(status=200, payload=None):
