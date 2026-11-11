@@ -290,9 +290,11 @@ class DataportalClient:
         # column chunk inside the file -- and pandas rejects it outright:
         #   TypeError: read_table() got an unexpected keyword argument 'compression'
         # Users reasonably pass it anyway, because the .parquet.zst name looks
-        # like an outer compression and because other tutorials do it for
-        # .pkl.bz2 (DataAnalysis2 calls getData(id, compression='bz2')). Drop it
-        # with a warning instead of failing on a correct, readable file.
+        # like an outer compression and because older tutorials do it for
+        # .pkl.bz2: DataAnalysis2 still calls getData(id, compression='bz2'),
+        # although the production ERDCmetrics files are *.zst.parquet now (plain
+        # parquet with a zstd column codec). Drop it with a warning instead of
+        # failing on a correct, readable file.
         if "compression" in extraArgs:
             dropped = extraArgs.pop("compression")
             _logger.warning(
