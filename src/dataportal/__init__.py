@@ -1,5 +1,13 @@
 from importlib.metadata import PackageNotFoundError, version
 
+from .autherrors import (
+    DataportalAuthError,
+    DatasetAccessDeniedError,
+    TokenExpiredError,
+    TokenRejectedError,
+    TokenRevokedError,
+    TokenScopeError,
+)
 from .chunkedlist import ChunkedList
 from .dataportalclient import DataportalClient
 

@@ -13,6 +13,7 @@ import requests
 import zstandard
 from pydantic import BaseModel, ValidationError
 
+from dataportal.autherrors import checkTokenExpiry, expiryWarning, raiseForStatus
 from dataportal.chunkedlist import ChunkedList
 from dataportal.logger import get_logger
 from dataportal.versions import __api_version__
@@ -124,7 +125,7 @@ class DataportalClient:
     relcachepath: str = ".cache/portalclient"
     statefile: str = "state.json"
 
-    def __init__(self, token: str | None = None, debug: bool = False, cleanStart: bool = False):
+    def __init__(self, token: str | None = None, debug: bool = False, cleanStart: bool = False, warnBeforeExpiry: float | None = None):
         """
             Creates a new DataportalClient object with the supplied token. If there exists a previously loaded
             file, the corresponding dataset will be selected by default if possible.
@@ -137,6 +138,10 @@ class DataportalClient:
                 whether to log debug messages. Defaults to False.
             cleanStart : bool, optional
                 whether to run a clean client and remove any existing state from previous clients.
+            warnBeforeExpiry : float, optional
+                log a warning when the token has less than this many seconds left (checked at connect and before
+                each file download). 0 turns the warning off. By default the window is derived from the token's own
+                lifetime: 10% of it, but at least 5 minutes and at most 1 day.
 
             Environment
             ----------
@@ -155,6 +160,8 @@ class DataportalClient:
         """
 
         self._s = requests.Session()
+
+        self.warnBeforeExpiry = warnBeforeExpiry
 
         self.token = token or os.environ.get("DATAPORTAL_CLIENT_TOKEN", None)
 
@@ -223,6 +230,12 @@ class DataportalClient:
 
         _logger.debug(f"connecting to {self.url}...")
 
+        # Pre-flight: an already-expired token is diagnosed locally, with no network call, and a nearly expired one is
+        # warned about (log only). The server stays the authority (see dataportal.autherrors); this only improves messages.
+        nearExpiry = checkTokenExpiry(self.token, self.warnBeforeExpiry)
+        if nearExpiry:
+            _logger.warning(nearExpiry)
+
         dataportal_api_version = self._sendRequest("v1/version").content.decode('utf-8')
         _logger.debug(f"server API version: {dataportal_api_version}, should be same minor/patch as {self.req_api_version}")
 
@@ -245,6 +258,12 @@ class DataportalClient:
     # Download file on fileID, will retry "self.recconectAttempt" times.
     def _downloadFile(self, fileID, destPath, extrafile=False):
         err: list[Exception] = []
+        # No network call: the token is read locally. This is the request where running out of token costs the user work
+        # (a long stream that dies part-way), so say so beforehand. Only a log line -- an unverified claim never stops the
+        # download; if the token is in fact expired the portal refuses it and that is explained then.
+        nearExpiry = expiryWarning(self.token, self.warnBeforeExpiry)
+        if nearExpiry:
+            _logger.warning("%s (about to download file %s)", nearExpiry, fileID)
         for attempt in range(self.reconnectAttemps):
             try:
                 with self._sendRequest(f"v1/dataset/{self.state.dataset.DatasetID}/files/{fileID}/content", query={'extrafile': 'true' if extrafile else 'false'}, stream=True) as r:
@@ -393,7 +412,8 @@ class DataportalClient:
             query_string = ""
         _logger.debug(f"sending {path + query_string}")
         response = self._s.get(os.path.join(self.url, path) + query_string, headers={"Authorization": "Bearer " + self.token}, stream=stream)  # noqa: PTH118 - Path would eat the // in the URL scheme
-        response.raise_for_status()
+        dataset = self.state.dataset if getattr(self, "state", None) is not None else None
+        raiseForStatus(response, self.token, path, dataset.DatasetName if dataset else None, dataset.DatasetID if dataset else None)
         return response
 
      # Load state file if it exists, otherwise create the path if missing
@@ -709,7 +729,8 @@ class DataportalClient:
             endDate=endDate,
             filter=filter,
             excludeFilter=excludeFilter,
-            extraFiles=extraFiles
+            extraFiles=extraFiles,
+            datasetName=self.state.dataset.DatasetName
         )
 
 class UnsupportedExtentionError(Exception):

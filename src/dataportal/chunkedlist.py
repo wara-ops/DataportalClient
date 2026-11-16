@@ -1,12 +1,14 @@
 import functools
 import logging
 import os
+import re
 import weakref
 from urllib.parse import quote
 
 import requests
 from frozendict import frozendict
 
+from dataportal.autherrors import raiseForStatus
 from dataportal.logger import get_logger
 
 _logger = get_logger()
@@ -66,7 +68,8 @@ class ChunkedList:
                  filter: str | None = None,
                  excludeFilter: str | None = None,
                  extraFiles: bool = False,
-                 allowedOrderFields: list | None = None
+                 allowedOrderFields: list | None = None,
+                 datasetName: str | None = None
             ):
 
         if allowedOrderFields is None:
@@ -99,6 +102,8 @@ class ChunkedList:
         self._filter = filter
         self._excludeFilter = excludeFilter
         self._extraFiles = extraFiles
+        # only used to name the dataset in authorisation error messages
+        self._datasetName = datasetName
 
         # Where in local data we are
         self._index = 0
@@ -184,7 +189,8 @@ class ChunkedList:
         # _logger.info(f"sending {path + queryString}")
         _logger.info("sending %s%s", os.path.join(self._url, path), queryString)  # noqa: PTH118 - Path would eat the // in the URL scheme
         response = self._s.get(os.path.join(self._url, path) + queryString, headers={"Authorization": "Bearer " + self._token}, stream=stream)  # noqa: PTH118 - Path would eat the // in the URL scheme
-        response.raise_for_status()
+        match = re.search(r"(?:^|/)dataset/(\d+)", path)
+        raiseForStatus(response, self._token, path, self._datasetName, int(match.group(1)) if match else None)
         return response
 
     def _fetch_data(self, index: int | str | None):
