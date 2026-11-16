@@ -1,5 +1,6 @@
 import gc
 import gzip
+import importlib.metadata
 import inspect
 import json
 import logging
@@ -19,6 +20,7 @@ import requests
 import zstandard
 from requests.exceptions import ChunkedEncodingError, HTTPError
 
+import dataportal
 from src.dataportal.dataportalclient import ChunkedList, DataportalClient, Dataset, File, NoDatasetError, ParquetEngineMissingError, UnsupportedExtentionError, _sniffCompression
 from tests.settings import (
     check_cache,
@@ -246,6 +248,17 @@ def mocked_responses(mocker):
 def client_clean():
     return DataportalClient(mocktoken, cleanStart=True)
 
+
+
+class TestPackageVersion:
+    def test_version_is_the_installed_distribution_version(self):
+        # __version__ must come from the installed metadata (which pdm-backend derived
+        # from the git tag), not from a file that can drift from the tag. It is the
+        # PEP 440 form, so '1.2.3' for the tag v1.2.3: no leading 'v'.
+        assert dataportal.__version__ == importlib.metadata.version("dataportalclient")
+
+    def test_api_version_is_not_part_of_the_package_surface(self):
+        assert not hasattr(dataportal, "__api_version__")
 
 
 class TestCreateClient:

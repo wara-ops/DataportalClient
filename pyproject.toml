@@ -31,8 +31,7 @@ pre_test = "cp versions.py src/dataportal/versions.py"
 pre_systest = "cp versions.py src/dataportal/versions.py"
 
 [tool.pdm.version]
-source = "file"
-path = "versions.py"
+source = "scm"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
